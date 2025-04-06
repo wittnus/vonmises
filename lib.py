@@ -4,7 +4,7 @@ from chex import Array
 from typing import Callable, Optional, Tuple
 
 
-def cluster_spherical(xs: Array, levels: int = 3) -> Tuple[Array, Array]:
+def cluster_spherical(xs: Array, levels: int = 3, vs: Optional[Array] = None) -> Tuple[Array, Array, Array] | Tuple[Array, Array, Array, Array] | Tuple[Array, Array, Array, Array, Array]:
     """Cluster vectors on a sphere using their normalized directions.
     
     Recursively cluster the data into 2^levels clusters by splitting in
@@ -15,15 +15,37 @@ def cluster_spherical(xs: Array, levels: int = 3) -> Tuple[Array, Array]:
     Args:
         xs: Input vectors with shape (n_samples, n_features)
         levels: Number of recursive splitting levels, resulting in 2^levels clusters
+        vs: Optional additional vectors with shape (n_samples, m) to be sorted 
+            according to the same clustering as xs
         
     Returns:
-        Tuple containing:
-            - centers: Array of cluster centers, organized in binary tree order
-            - clustered_data: Original data organized by cluster
+        If vs is None:
+            Tuple containing:
+                - centers: Array of cluster centers, organized in binary tree order
+                - log_weights: Log of total exponential weights for all nodes in the tree,
+                  with the same shape as centers. Each entry contains the log of the sum
+                  of exponential weights for all points in that subtree.
+                - clustered_data: Original data organized by cluster
+        If vs is provided:
+            Tuple containing:
+                - centers: Array of cluster centers, organized in binary tree order
+                - log_weights: Log of total exponential weights for all nodes in the tree,
+                  with the same shape as centers. Each entry contains the log of the sum
+                  of exponential weights for all points in that subtree.
+                - weighted_value_means: Weighted means of vs for each node in the tree,
+                  with shape matching the tree structure. For efficient attention approximation.
+                - clustered_data: Original data organized by cluster
+                - clustered_vs: The vs vectors organized by the same clustering
     """
     n_clusters = 2**levels
     n_samples = xs.shape[0]
     n_per_cluster = n_samples // n_clusters
+    
+    # Check if vs is provided and has the correct first dimension
+    has_vs = vs is not None
+    if has_vs and vs.shape[0] != n_samples:
+        raise ValueError(f"vs must have the same first dimension as xs. "
+                         f"Got xs.shape[0]={n_samples}, vs.shape[0]={vs.shape[0]}")
     
     # Compute magnitudes (weights) and normalize vectors
     magnitudes = jnp.sqrt(jnp.sum(xs**2, axis=1, keepdims=True))
@@ -37,6 +59,15 @@ def cluster_spherical(xs: Array, levels: int = 3) -> Tuple[Array, Array]:
     
     # Initialize centers array
     all_centers = jnp.zeros((2*n_clusters-1, xs.shape[1]))
+    
+    # Initialize log_weights array for all nodes in the tree
+    all_log_weights = jnp.zeros(2*n_clusters-1)
+    
+    # Initialize weighted value means array if vs is provided
+    all_weighted_means = None
+    if has_vs:
+        vs_shape = vs.shape[1] if vs.ndim > 1 else 1
+        all_weighted_means = jnp.zeros((2*n_clusters-1, vs_shape))
     
     # Define weighted k-means function using JAX
     def kmeans_balanced(data, data_weights, key):
@@ -92,55 +123,105 @@ def cluster_spherical(xs: Array, levels: int = 3) -> Tuple[Array, Array]:
         return centroids, sorted_idx[:half], sorted_idx[half:]
     
     # Recursive clustering function with non-local state
-    def recursive_cluster(data, data_weights, data_original, indices, node_idx, depth, key, centers):
+    def recursive_cluster(data, data_weights, data_original, data_vs, indices, node_idx, depth, key, centers, log_weights, weighted_means=None):
         key, subkey = jax.random.split(key)
         
+        # Calculate log of total weights for this node
+        sum_weights = jnp.sum(data_weights) + 1e-10
+        log_sum_weights = jnp.log(sum_weights)
+        log_weights = log_weights.at[node_idx].set(log_sum_weights)
+        
+        # Compute weighted center
+        weighted_sum = jnp.sum(data * data_weights[:, None], axis=0)
+        center = weighted_sum / sum_weights
+        
+        # Do not normalize - keep center inside the sphere
+        centers = centers.at[node_idx].set(center)
+        
+        # If vs is provided, compute weighted mean of vs for this node
+        if has_vs and weighted_means is not None:
+            if data_vs.ndim > 1:
+                # For multi-dimensional vs
+                weighted_v_sum = jnp.sum(data_vs * data_weights[:, None], axis=0)
+            else:
+                # For 1D vs
+                weighted_v_sum = jnp.sum(data_vs * data_weights)
+                
+            weighted_v_mean = weighted_v_sum / sum_weights
+            weighted_means = weighted_means.at[node_idx].set(weighted_v_mean)
+        
         if depth == levels:
-            # Leaf node: compute weighted center and return data
-            # For the center, use weighted mean with original magnitudes
-            sum_weights = jnp.sum(data_weights) + 1e-10
-            weighted_sum = jnp.sum(data * data_weights[:, None], axis=0)
-            center = weighted_sum / sum_weights
-            
-            # Do not normalize - keep center inside the sphere
-            
-            centers = centers.at[node_idx].set(center)
-            # Return the original data points (not normalized)
-            return centers, data_original, indices
+            # Leaf node: return the original data points (not normalized) and vs if provided
+            if has_vs:
+                return centers, log_weights, weighted_means, data_original, data_vs, indices
+            else:
+                return centers, log_weights, data_original, indices
         
         # Split using balanced k-means on normalized data
         centroids, left_idx, right_idx = kmeans_balanced(data, data_weights, subkey)
         
-        # Update internal node center
-        # Use average of centroids, do not normalize
-        center = (centroids[0] + centroids[1]) / 2
-        centers = centers.at[node_idx].set(center)
-        
         # Process left subtree
         left_key, right_key = jax.random.split(subkey)
-        centers, left_data, left_indices = recursive_cluster(
-            data[left_idx], data_weights[left_idx], data_original[left_idx], 
-            indices[left_idx], 2*node_idx+1, depth+1, left_key, centers)
         
-        # Process right subtree
-        centers, right_data, right_indices = recursive_cluster(
-            data[right_idx], data_weights[right_idx], data_original[right_idx],
-            indices[right_idx], 2*node_idx+2, depth+1, right_key, centers)
-        
-        return centers, jnp.vstack([left_data, right_data]), jnp.concatenate([left_indices, right_indices])
+        if has_vs:
+            # Pass vs slices along with the data
+            data_vs_left = data_vs[left_idx] if has_vs else None
+            data_vs_right = data_vs[right_idx] if has_vs else None
+            
+            # Process left subtree with vs
+            centers, log_weights, weighted_means, left_data, left_vs, left_indices = recursive_cluster(
+                data[left_idx], data_weights[left_idx], data_original[left_idx],
+                data_vs_left, indices[left_idx], 2*node_idx+1, depth+1, left_key, centers, log_weights, weighted_means)
+            
+            # Process right subtree with vs
+            centers, log_weights, weighted_means, right_data, right_vs, right_indices = recursive_cluster(
+                data[right_idx], data_weights[right_idx], data_original[right_idx],
+                data_vs_right, indices[right_idx], 2*node_idx+2, depth+1, right_key, centers, log_weights, weighted_means)
+            
+            return centers, log_weights, weighted_means, jnp.vstack([left_data, right_data]), jnp.vstack([left_vs, right_vs]), jnp.concatenate([left_indices, right_indices])
+        else:
+            # Original behavior without vs
+            centers, log_weights, left_data, left_indices = recursive_cluster(
+                data[left_idx], data_weights[left_idx], data_original[left_idx],
+                None, indices[left_idx], 2*node_idx+1, depth+1, left_key, centers, log_weights)
+            
+            # Process right subtree
+            centers, log_weights, right_data, right_indices = recursive_cluster(
+                data[right_idx], data_weights[right_idx], data_original[right_idx],
+                None, indices[right_idx], 2*node_idx+2, depth+1, right_key, centers, log_weights)
+            
+            return centers, log_weights, jnp.vstack([left_data, right_data]), jnp.concatenate([left_indices, right_indices])
     
     # Create array of original indices to track point order
     original_indices = jnp.arange(n_samples)
     
     # Start recursive clustering from root (node 0)
     key = jax.random.PRNGKey(0)
-    all_centers, clustered_xs, sorted_indices = recursive_cluster(
-        normalized_xs, weights, xs, original_indices, 0, 0, key, all_centers)
     
-    # Reshape clustered data to desired output format with even distribution
-    clustered_xs = clustered_xs.reshape((n_clusters, n_per_cluster, -1))
-    
-    return all_centers, clustered_xs
+    if has_vs:
+        # Call recursive_cluster with vs
+        all_centers, all_log_weights, all_weighted_means, clustered_xs, clustered_vs, sorted_indices = recursive_cluster(
+            normalized_xs, weights, xs, vs, original_indices, 0, 0, key, all_centers, all_log_weights, all_weighted_means)
+        
+        # Reshape clustered data to desired output format with even distribution
+        clustered_xs = clustered_xs.reshape((n_clusters, n_per_cluster, -1))
+        
+        # Reshape clustered values based on their dimensionality
+        if vs.ndim > 1:
+            clustered_vs = clustered_vs.reshape((n_clusters, n_per_cluster, vs.shape[1]))
+        else:
+            clustered_vs = clustered_vs.reshape((n_clusters, n_per_cluster))
+        
+        return all_centers, all_log_weights, all_weighted_means, clustered_xs, clustered_vs
+    else:
+        # Original behavior without vs
+        all_centers, all_log_weights, clustered_xs, sorted_indices = recursive_cluster(
+            normalized_xs, weights, xs, None, original_indices, 0, 0, key, all_centers, all_log_weights)
+        
+        # Reshape clustered data to desired output format with even distribution
+        clustered_xs = clustered_xs.reshape((n_clusters, n_per_cluster, -1))
+        
+        return all_centers, all_log_weights, clustered_xs
 
 
 def cluster(xs: Array, levels: int = 3) -> Tuple[Array, Array]:
@@ -280,9 +361,609 @@ def log_expected_query_mass(query, centroid):
         saddle_point_case
     )
 
-def approx_qkv_attention(queries: Array, centroids: Array, keys: Array, values: Array):
-    """Given queries and centroids from hierarchical clustering, compute the approximate
-    attention weights and output values. keys and values are organized as in the output
-    of cluster_spherical.
+def approx_qkv_attention(query: Array, centers: Array, log_weights: Array, 
+                       clustered_keys: Array, clustered_values: Array, 
+                       weighted_means: Optional[Array] = None, beam_width: int = 4,
+                       pruning_threshold: float = -10.0) -> Array:
+    """Compute approximate attention for a single query using hierarchical clustering.
+    
+    Instead of a complex hierarchical beam search, this simplified approach:
+    1. Calculates scores for all leaf clusters directly
+    2. Selects the top-k leaf clusters based on expected attention mass
+    3. Computes exact attention for those selected clusters
+    4. Optionally uses weighted value means to approximate other clusters
+    
+    Args:
+        query: Single query vector [d]
+        centers: Hierarchical cluster centers [(2^levels-1) + 2^levels, d]
+        log_weights: Log-sum of exponential weights for all nodes [(2^levels-1) + 2^levels]
+        clustered_keys: Keys organized by cluster [2^levels, keys_per_cluster, d]
+        clustered_values: Values organized by cluster [2^levels, keys_per_cluster, d_v]
+        weighted_means: Optional weighted means of values for each node [(2^levels-1) + 2^levels, d_v]
+        beam_width: Number of leaf clusters to compute exactly
+        pruning_threshold: Log-score threshold for including nodes in residual approximation
+        
+    Returns:
+        Approximate attention output vector [d_v]
     """
-    raise NotImplementedError("This function is not implemented yet.")
+    # Calculate dimensions
+    num_centers = centers.shape[0]
+    num_leaves = clustered_keys.shape[0]
+    leaf_start_idx = num_centers - num_leaves
+    
+    # Calculate scores for all leaf nodes
+    leaf_scores = []
+    for i in range(num_leaves):
+        node_idx = leaf_start_idx + i
+        centroid = centers[node_idx]
+        # Calculate expected attention mass (log scale)
+        direction_score = log_expected_query_mass(query, centroid)
+        total_score = direction_score + log_weights[node_idx]
+        leaf_scores.append(total_score)
+    
+    # Convert to array and find top beam_width leaves
+    leaf_scores = jnp.array(leaf_scores)
+    k = min(beam_width, num_leaves)
+    
+    # Sort scores (descending) and get indices of top-k leaves
+    sorted_indices = jnp.argsort(-leaf_scores)
+    top_k_indices = sorted_indices[:k]
+    
+    # Compute exact attention for selected leaf clusters
+    weighted_sum = jnp.zeros_like(clustered_values[0, 0])
+    normalization = 0.0
+    
+    # Process each selected cluster
+    for i in range(k):
+        leaf_idx = top_k_indices[i]
+        keys = clustered_keys[leaf_idx]
+        values = clustered_values[leaf_idx]
+        
+        # Compute attention weights for all keys in this cluster
+        scores = jnp.exp(jnp.dot(query, keys.T))
+        
+        # Update weighted sum and normalization
+        weighted_sum += jnp.sum(scores[:, None] * values, axis=0)
+        normalization += jnp.sum(scores)
+    
+    # If weighted means are provided, use them to approximate the rest
+    if weighted_means is not None:
+        # Compute contributions from non-selected leaf nodes
+        for i in range(num_leaves):
+            # Skip if this is a selected leaf
+            if i in top_k_indices:
+                continue
+                
+            node_idx = leaf_start_idx + i
+            score = leaf_scores[i]
+            
+            # Only include nodes with sufficient score
+            if score > pruning_threshold:
+                # Get the weighted mean value for this node
+                node_mean = weighted_means[node_idx]
+                
+                # Add approximate contribution
+                approx_mass = jnp.exp(score)
+                weighted_sum += approx_mass * node_mean
+                normalization += approx_mass
+        
+        # Also consider internal nodes for approximation
+        for node_idx in range(leaf_start_idx):
+            # Calculate expected attention mass
+            centroid = centers[node_idx]
+            node_score = log_expected_query_mass(query, centroid) + log_weights[node_idx]
+            
+            # Only include nodes with sufficient score
+            if node_score > pruning_threshold:
+                # Get weighted mean value for this node
+                node_mean = weighted_means[node_idx]
+                
+                # Add approximate contribution
+                approx_mass = jnp.exp(node_score)
+                weighted_sum += approx_mass * node_mean
+                normalization += approx_mass
+    
+    # Normalize the weighted sum
+    safe_normalization = jnp.maximum(normalization, 1e-10)  # Avoid division by zero
+    attention_output = weighted_sum / safe_normalization
+    
+    return attention_output
+
+def batched_approx_qkv_attention(queries: Array, centers: Array, log_weights: Array,
+                                clustered_keys: Array, clustered_values: Array, 
+                                weighted_means: Optional[Array] = None,
+                                beam_width: int = 4, pruning_threshold: float = -10.0) -> Array:
+    """Compute approximate attention for a batch of queries using hierarchical clustering.
+    
+    Processes a batch of queries, applying the approximate attention algorithm to each query.
+    
+    Args:
+        queries: Batch of query vectors [batch_size, d]
+        centers: Hierarchical cluster centers [(2^levels-1) + 2^levels, d]
+        log_weights: Log-sum of exponential weights for each node [(2^levels-1) + 2^levels]
+        clustered_keys: Keys organized by cluster [2^levels, keys_per_cluster, d]
+        clustered_values: Values organized by cluster [2^levels, keys_per_cluster, d_v]
+        weighted_means: Optional weighted means of values for each node [(2^levels-1) + 2^levels, d_v]
+        beam_width: Number of leaf clusters to compute exactly
+        pruning_threshold: Log-score threshold for including nodes in residual approximation
+        
+    Returns:
+        Batch of approximate attention output vectors [batch_size, d_v]
+    """
+    try:
+        # Import tqdm for progress tracking
+        from tqdm import tqdm
+        has_tqdm = True
+    except ImportError:
+        has_tqdm = False
+    
+    # Process each query individually - this is not parallelized but is safe
+    results = []
+    
+    # Use tqdm if available, otherwise use regular for loop
+    query_iterator = tqdm(queries, desc="Processing queries") if has_tqdm else queries
+    
+    for query in query_iterator:
+        result = approx_qkv_attention(
+            query, centers, log_weights, clustered_keys, clustered_values,
+            weighted_means, beam_width, pruning_threshold
+        )
+        results.append(result)
+    
+    # Stack results into a batch
+    return jnp.stack(results)
+
+
+@jax.jit
+def simple_approx_qkv_attention(query: Array, centers: Array, log_weights: Array, 
+                              clustered_keys: Array, clustered_values: Array, 
+                              weighted_means: Array) -> Array:
+    """
+    Extremely simplified approximate attention using just the single best cluster
+    and residual approximation from all other nodes.
+    
+    This is fully JAX-compatible with no Python control flow and can be JIT-compiled
+    for maximum performance.
+    
+    Args:
+        query: Single query vector [d]
+        centers: Hierarchical cluster centers [(2^levels-1) + 2^levels, d]
+        log_weights: Log-sum of weights for each node [(2^levels-1) + 2^levels]
+        clustered_keys: Keys organized by cluster [2^levels, keys_per_cluster, d]
+        clustered_values: Values organized by cluster [2^levels, keys_per_cluster, d_v]
+        weighted_means: Weighted means of values for each node [(2^levels-1) + 2^levels, d_v]
+        
+    Returns:
+        Approximate attention output vector [d_v]
+    """
+    # 1. Calculate dimensions
+    num_centers = centers.shape[0]
+    num_leaves = clustered_keys.shape[0]
+    leaf_start_idx = num_centers - num_leaves
+    
+    # 2. Calculate log scores for all nodes in one vectorized operation
+    def score_node(node_idx):
+        centroid = centers[node_idx]
+        return log_expected_query_mass(query, centroid) + log_weights[node_idx]
+    
+    all_node_indices = jnp.arange(num_centers)
+    all_node_scores = jax.vmap(score_node)(all_node_indices)
+    
+    # 3. Find the best leaf node
+    leaf_indices = jnp.arange(num_leaves)
+    leaf_nodes = leaf_start_idx + leaf_indices
+    leaf_scores = all_node_scores[leaf_nodes]
+    best_leaf_idx = jnp.argmax(leaf_scores)
+    
+    # 4. Compute exact attention for the best leaf cluster
+    keys = clustered_keys[best_leaf_idx]
+    values = clustered_values[best_leaf_idx]
+    scores = jnp.exp(jnp.dot(query, keys.T))
+    exact_weighted_sum = jnp.sum(scores[:, None] * values, axis=0)
+    exact_norm = jnp.sum(scores)
+    
+    # 5. Compute residual approximation for all other nodes
+    # Create a mask for the selected leaf (all False array with one True)
+    selected_mask = jnp.zeros(num_centers, dtype=bool).at[leaf_start_idx + best_leaf_idx].set(True)
+    
+    # Get scores and means for all unselected nodes
+    unselected_mask = ~selected_mask
+    
+    # Use advanced indexing with a boolean mask - JAX friendly version
+    # Instead of direct indexing (which causes tracing issues), we use where to zero out unwanted values
+    masked_scores = jnp.where(unselected_mask, all_node_scores, -jnp.inf)  # Set unwanted to -inf
+    
+    # Apply threshold directly with another where operation
+    threshold = -10.0  # Fixed threshold
+    above_threshold = masked_scores > threshold
+    
+    # Calculate contributions for all nodes, zeroing out those that are selected or below threshold
+    exp_scores = jnp.where(above_threshold, jnp.exp(masked_scores), 0.0)
+    
+    # Compute weighted sum for approximation
+    approx_weighted_sum = jnp.zeros_like(weighted_means[0])
+    approx_norm = 0.0
+    
+    # Loop-free approach to compute the contribution from all nodes
+    for i in range(num_centers):
+        # This loop is unrolled by JAX since num_centers is a fixed value at compilation time
+        # Add contribution if node is above threshold and not the selected leaf
+        contrib = exp_scores[i] * weighted_means[i]
+        approx_weighted_sum += contrib
+        approx_norm += exp_scores[i]
+    
+    # 6. Combine exact and approximated results
+    total_weighted_sum = exact_weighted_sum + approx_weighted_sum
+    total_norm = exact_norm + approx_norm
+    
+    # 7. Normalize and return
+    safe_norm = jnp.maximum(total_norm, 1e-10)
+    return total_weighted_sum / safe_norm
+
+@jax.jit
+def batched_simple_approx_qkv_attention(queries: Array, centers: Array, log_weights: Array,
+                                      clustered_keys: Array, clustered_values: Array,
+                                      weighted_means: Array) -> Array:
+    """
+    Vectorized version of simple_approx_qkv_attention that processes a batch of queries
+    in parallel using JAX's vmap.
+    
+    Args:
+        queries: Batch of query vectors [batch_size, d]
+        centers: Hierarchical cluster centers [(2^levels-1) + 2^levels, d]
+        log_weights: Log-sum of weights for each node [(2^levels-1) + 2^levels]
+        clustered_keys: Keys organized by cluster [2^levels, keys_per_cluster, d]
+        clustered_values: Values organized by cluster [2^levels, keys_per_cluster, d_v]
+        weighted_means: Weighted means of values for each node [(2^levels-1) + 2^levels, d_v]
+        
+    Returns:
+        Batch of attention output vectors [batch_size, d_v]
+    """
+    # Vectorize the single-query function across the batch dimension
+    return jax.vmap(simple_approx_qkv_attention, in_axes=(0, None, None, None, None, None))(
+        queries, centers, log_weights, clustered_keys, clustered_values, weighted_means)
+
+
+@jax.jit
+def stochastic_approx_qkv_attention(query: Array, centers: Array, log_weights: Array, 
+                                  clustered_keys: Array, clustered_values: Array, 
+                                  weighted_means: Array, temperature: float = 1.0,
+                                  key: Optional[jax.random.PRNGKey] = None) -> Array:
+    """
+    Approximate attention using the best cluster deterministically and sampling a second
+    cluster stochastically based on a temperature-controlled softmax distribution.
+    
+    This approach provides a balance between exploitation (best cluster) and exploration
+    (stochastic sampling), which can improve gradient estimates during training.
+    
+    Args:
+        query: Single query vector [d]
+        centers: Hierarchical cluster centers [(2^levels-1) + 2^levels, d]
+        log_weights: Log-sum of weights for each node [(2^levels-1) + 2^levels]
+        clustered_keys: Keys organized by cluster [2^levels, keys_per_cluster, d]
+        clustered_values: Values organized by cluster [2^levels, keys_per_cluster, d_v]
+        weighted_means: Weighted means of values for each node [(2^levels-1) + 2^levels, d_v]
+        temperature: Controls the "peakiness" of the softmax distribution for sampling.
+                     Higher values (>1.0) make the distribution more uniform.
+                     Lower values (<1.0) make it more peaked around the highest scores.
+        key: Optional PRNG key for random sampling. If None, a new one will be created.
+        
+    Returns:
+        Approximate attention output vector [d_v]
+    """
+    # Create a PRNG key if not provided
+    if key is None:
+        key = jax.random.PRNGKey(0)
+    
+    # 1. Calculate dimensions
+    num_centers = centers.shape[0]
+    num_leaves = clustered_keys.shape[0]
+    leaf_start_idx = num_centers - num_leaves
+    
+    # 2. Calculate log scores for all leaf nodes in one vectorized operation
+    def score_node(node_idx):
+        centroid = centers[node_idx]
+        return log_expected_query_mass(query, centroid) + log_weights[node_idx]
+    
+    leaf_nodes = jnp.arange(num_leaves) + leaf_start_idx
+    leaf_scores = jax.vmap(score_node)(leaf_nodes)
+    
+    # 3. Find the best leaf node (deterministic selection)
+    best_leaf_idx = jnp.argmax(leaf_scores)
+    best_score = leaf_scores[best_leaf_idx]
+    
+    # 4. Sample a second leaf node based on softmax distribution
+    # First, create a mask to exclude the best leaf
+    mask = jnp.ones(num_leaves, dtype=bool).at[best_leaf_idx].set(False)
+    
+    # Apply temperature to the logits and create a valid distribution
+    # Note: we normalize by the maximum score for numerical stability
+    adjusted_scores = (leaf_scores - jnp.max(leaf_scores)) / temperature
+    
+    # Set the probability of the best leaf to zero (already selected deterministically)
+    # and compute softmax over remaining leaves
+    masked_scores = jnp.where(mask, adjusted_scores, -1e10)  # Set excluded leaf to very negative value
+    probs = jax.nn.softmax(masked_scores)
+    
+    # Sample from this distribution
+    sampled_leaf_idx = jax.random.choice(key, jnp.arange(num_leaves), p=probs)
+    
+    # 5. Create a mask for the two selected leaf clusters
+    selected_leaves = jnp.array([best_leaf_idx, sampled_leaf_idx])
+    selected_leaf_nodes = leaf_start_idx + selected_leaves
+    
+    # 6. Compute exact attention for the two selected leaf clusters
+    total_weighted_sum = jnp.zeros_like(clustered_values[0, 0])
+    total_norm = 0.0
+    
+    # Process each selected cluster
+    for i in range(2):
+        leaf_idx = selected_leaves[i]
+        keys = clustered_keys[leaf_idx]
+        values = clustered_values[leaf_idx]
+        
+        # Compute attention scores for this cluster
+        scores = jnp.exp(jnp.dot(query, keys.T))
+        
+        # Update weighted sum and normalization
+        cluster_weighted_sum = jnp.sum(scores[:, None] * values, axis=0)
+        cluster_norm = jnp.sum(scores)
+        
+        total_weighted_sum += cluster_weighted_sum
+        total_norm += cluster_norm
+    
+    # 7. Compute residual approximation for all other nodes
+    # Create a mask for selected leaf nodes (all False array with two True values)
+    selected_mask = jnp.zeros(num_centers, dtype=bool)
+    selected_mask = selected_mask.at[selected_leaf_nodes[0]].set(True)
+    selected_mask = selected_mask.at[selected_leaf_nodes[1]].set(True)
+    
+    # Get scores for all unselected nodes
+    unselected_mask = ~selected_mask
+    
+    # Calculate scores for all nodes
+    all_node_indices = jnp.arange(num_centers)
+    all_node_scores = jax.vmap(score_node)(all_node_indices)
+    
+    # Use mask to zero out selected nodes and apply threshold
+    masked_scores = jnp.where(unselected_mask, all_node_scores, -jnp.inf)
+    threshold = -10.0  # Fixed threshold
+    above_threshold = masked_scores > threshold
+    
+    # Calculate contributions for all remaining nodes (zeroing out selected nodes and those below threshold)
+    exp_scores = jnp.where(above_threshold, jnp.exp(masked_scores), 0.0)
+    
+    # Compute residual weighted sum
+    residual_weighted_sum = jnp.zeros_like(weighted_means[0])
+    residual_norm = 0.0
+    
+    # Loop-free approach for residual computation
+    for i in range(num_centers):
+        # Add contribution if node is above threshold and not selected
+        contrib = exp_scores[i] * weighted_means[i]
+        residual_weighted_sum += contrib
+        residual_norm += exp_scores[i]
+    
+    # 8. Combine exact and approximated results
+    total_weighted_sum += residual_weighted_sum
+    total_norm += residual_norm
+    
+    # 9. Normalize and return
+    safe_norm = jnp.maximum(total_norm, 1e-10)
+    return total_weighted_sum / safe_norm
+
+
+@jax.jit
+def adaptive_stochastic_approx_qkv_attention(query: Array, centers: Array, log_weights: Array, 
+                                           clustered_keys: Array, clustered_values: Array, 
+                                           weighted_means: Array, temperature: float = 1.0,
+                                           key: Optional[jax.random.PRNGKey] = None) -> Array:
+    """
+    Enhanced stochastic attention with adaptive residual weighting to reduce bias.
+    
+    This approach:
+    1. Deterministically selects the highest-scoring cluster
+    2. Stochastically samples a second cluster based on a softmax distribution
+    3. Estimates the attention mass captured by these two clusters
+    4. Applies adaptive residual weighting based on the captured mass ratio
+    
+    Args:
+        query: Single query vector [d]
+        centers: Hierarchical cluster centers [(2^levels-1) + 2^levels, d]
+        log_weights: Log-sum of weights for each node [(2^levels-1) + 2^levels]
+        clustered_keys: Keys organized by cluster [2^levels, keys_per_cluster, d]
+        clustered_values: Values organized by cluster [2^levels, keys_per_cluster, d_v]
+        weighted_means: Weighted means of values for each node [(2^levels-1) + 2^levels, d_v]
+        temperature: Controls the "peakiness" of the softmax distribution for sampling
+        key: Optional PRNG key for random sampling. If None, a new one will be created.
+        
+    Returns:
+        Approximate attention output vector [d_v]
+    """
+    # Create a PRNG key if not provided
+    if key is None:
+        key = jax.random.PRNGKey(0)
+    
+    # 1. Calculate dimensions
+    num_centers = centers.shape[0]
+    num_leaves = clustered_keys.shape[0]
+    leaf_start_idx = num_centers - num_leaves
+    
+    # 2. Calculate log scores for all leaf nodes in one vectorized operation
+    def score_node(node_idx):
+        centroid = centers[node_idx]
+        return log_expected_query_mass(query, centroid) + log_weights[node_idx]
+    
+    leaf_nodes = jnp.arange(num_leaves) + leaf_start_idx
+    leaf_scores = jax.vmap(score_node)(leaf_nodes)
+    
+    # 3. Find the best leaf node (deterministic selection)
+    best_leaf_idx = jnp.argmax(leaf_scores)
+    best_score = leaf_scores[best_leaf_idx]
+    
+    # 4. Sample a second leaf node based on softmax distribution
+    # First, create a mask to exclude the best leaf
+    mask = jnp.ones(num_leaves, dtype=bool).at[best_leaf_idx].set(False)
+    
+    # Apply temperature to the logits and create a valid distribution
+    adjusted_scores = (leaf_scores - jnp.max(leaf_scores)) / temperature
+    
+    # Set the probability of the best leaf to zero and compute softmax over remaining leaves
+    masked_scores = jnp.where(mask, adjusted_scores, -1e10)  # Set excluded leaf to very negative value
+    probs = jax.nn.softmax(masked_scores)
+    
+    # Sample from this distribution
+    sampled_leaf_idx = jax.random.choice(key, jnp.arange(num_leaves), p=probs)
+    
+    # 5. Calculate the total expected attention mass and the fraction captured by selected clusters
+    # Convert log scores to actual scores (probabilities) using softmax
+    exp_leaf_scores = jnp.exp(leaf_scores - jnp.max(leaf_scores))  # Stabilized exp
+    total_leaf_mass = jnp.sum(exp_leaf_scores)
+    
+    # Calculate mass captured by our two selected clusters
+    selected_leaves = jnp.array([best_leaf_idx, sampled_leaf_idx])
+    selected_exp_scores = jnp.array([exp_leaf_scores[best_leaf_idx], exp_leaf_scores[sampled_leaf_idx]])
+    selected_mass = jnp.sum(selected_exp_scores)
+    
+    # Calculate the mass ratio (how much attention mass we've captured with our two clusters)
+    mass_ratio = selected_mass / total_leaf_mass
+    
+    # 6. Compute exact attention for the two selected leaf clusters
+    selected_leaf_nodes = leaf_start_idx + selected_leaves
+    
+    exact_weighted_sum = jnp.zeros_like(clustered_values[0, 0])
+    exact_norm = 0.0
+    
+    # Process each selected cluster
+    for i in range(2):
+        leaf_idx = selected_leaves[i]
+        keys = clustered_keys[leaf_idx]
+        values = clustered_values[leaf_idx]
+        
+        # Compute attention scores for this cluster
+        scores = jnp.exp(jnp.dot(query, keys.T))
+        
+        # Update weighted sum and normalization
+        cluster_weighted_sum = jnp.sum(scores[:, None] * values, axis=0)
+        cluster_norm = jnp.sum(scores)
+        
+        exact_weighted_sum += cluster_weighted_sum
+        exact_norm += cluster_norm
+    
+    # 7. Compute residual approximation for all other nodes
+    # Create a mask for selected leaf nodes
+    selected_mask = jnp.zeros(num_centers, dtype=bool)
+    selected_mask = selected_mask.at[selected_leaf_nodes[0]].set(True)
+    selected_mask = selected_mask.at[selected_leaf_nodes[1]].set(True)
+    
+    # Get scores for all unselected nodes
+    unselected_mask = ~selected_mask
+    
+    # Calculate scores for all nodes
+    all_node_indices = jnp.arange(num_centers)
+    all_node_scores = jax.vmap(score_node)(all_node_indices)
+    
+    # Use mask to zero out selected nodes and apply threshold
+    masked_scores = jnp.where(unselected_mask, all_node_scores, -jnp.inf)
+    threshold = -10.0  # Fixed threshold
+    above_threshold = masked_scores > threshold
+    
+    # Calculate contributions for all remaining nodes (zeroing out selected nodes and those below threshold)
+    exp_scores = jnp.where(above_threshold, jnp.exp(masked_scores), 0.0)
+    
+    # Compute residual weighted sum
+    residual_weighted_sum = jnp.zeros_like(weighted_means[0])
+    residual_norm = 0.0
+    
+    # Loop-free approach for residual computation
+    for i in range(num_centers):
+        # Add contribution if node is above threshold and not selected
+        contrib = exp_scores[i] * weighted_means[i]
+        residual_weighted_sum += contrib
+        residual_norm += exp_scores[i]
+    
+    # 8. Apply adaptive residual weighting based on the mass ratio
+    # When mass_ratio is high (most mass captured by selected clusters), 
+    # reduce the contribution of the residual approximation
+    residual_weight = 1.0 - mass_ratio  # Lower weight when more mass is captured
+    
+    weighted_residual_sum = residual_weighted_sum * residual_weight
+    weighted_residual_norm = residual_norm * residual_weight
+    
+    # 9. Combine exact and weighted residual approximation results
+    total_weighted_sum = exact_weighted_sum + weighted_residual_sum
+    total_norm = exact_norm + weighted_residual_norm
+    
+    # 10. Normalize and return
+    safe_norm = jnp.maximum(total_norm, 1e-10)
+    return total_weighted_sum / safe_norm
+
+
+@jax.jit
+def batched_stochastic_approx_qkv_attention(queries: Array, centers: Array, log_weights: Array,
+                                          clustered_keys: Array, clustered_values: Array,
+                                          weighted_means: Array, temperature: float = 1.0,
+                                          key: Optional[jax.random.PRNGKey] = None) -> Array:
+    """
+    Vectorized version of stochastic_approx_qkv_attention that processes a batch of queries
+    in parallel using JAX's vmap.
+    
+    Args:
+        queries: Batch of query vectors [batch_size, d]
+        centers: Hierarchical cluster centers [(2^levels-1) + 2^levels, d]
+        log_weights: Log-sum of weights for each node [(2^levels-1) + 2^levels]
+        clustered_keys: Keys organized by cluster [2^levels, keys_per_cluster, d]
+        clustered_values: Values organized by cluster [2^levels, keys_per_cluster, d_v]
+        weighted_means: Weighted means of values for each node [(2^levels-1) + 2^levels, d_v]
+        temperature: Controls the "peakiness" of the softmax distribution for sampling
+        key: Optional PRNG key for random sampling. If None, a new one will be created.
+        
+    Returns:
+        Batch of attention output vectors [batch_size, d_v]
+    """
+    # Create a PRNG key if not provided and split it for each query
+    if key is None:
+        key = jax.random.PRNGKey(0)
+    
+    # Create a unique key for each query in the batch
+    batch_size = queries.shape[0]
+    keys = jax.random.split(key, batch_size)
+    
+    # Vectorize the single-query function across the batch dimension
+    return jax.vmap(stochastic_approx_qkv_attention, in_axes=(0, None, None, None, None, None, None, 0))(
+        queries, centers, log_weights, clustered_keys, clustered_values, weighted_means, temperature, keys)
+
+
+@jax.jit
+def batched_adaptive_stochastic_approx_qkv_attention(queries: Array, centers: Array, log_weights: Array,
+                                                  clustered_keys: Array, clustered_values: Array,
+                                                  weighted_means: Array, temperature: float = 1.0,
+                                                  key: Optional[jax.random.PRNGKey] = None) -> Array:
+    """
+    Vectorized version of adaptive_stochastic_approx_qkv_attention that processes a batch of 
+    queries in parallel using JAX's vmap.
+    
+    Args:
+        queries: Batch of query vectors [batch_size, d]
+        centers: Hierarchical cluster centers [(2^levels-1) + 2^levels, d]
+        log_weights: Log-sum of weights for each node [(2^levels-1) + 2^levels]
+        clustered_keys: Keys organized by cluster [2^levels, keys_per_cluster, d]
+        clustered_values: Values organized by cluster [2^levels, keys_per_cluster, d_v]
+        weighted_means: Weighted means of values for each node [(2^levels-1) + 2^levels, d_v]
+        temperature: Controls the "peakiness" of the softmax distribution for sampling
+        key: Optional PRNG key for random sampling. If None, a new one will be created.
+        
+    Returns:
+        Batch of attention output vectors [batch_size, d_v]
+    """
+    # Create a PRNG key if not provided and split it for each query
+    if key is None:
+        key = jax.random.PRNGKey(0)
+    
+    # Create a unique key for each query in the batch
+    batch_size = queries.shape[0]
+    keys = jax.random.split(key, batch_size)
+    
+    # Vectorize the single-query function across the batch dimension
+    return jax.vmap(adaptive_stochastic_approx_qkv_attention, in_axes=(0, None, None, None, None, None, None, 0))(
+        queries, centers, log_weights, clustered_keys, clustered_values, weighted_means, temperature, keys)

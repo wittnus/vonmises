@@ -8,7 +8,13 @@ import matplotlib.gridspec as gridspec
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.stats import chi2
 import math
-from lib import cluster, cluster_spherical
+from lib import (
+    cluster, cluster_spherical, approx_qkv_attention, batched_approx_qkv_attention,
+    simple_approx_qkv_attention, batched_simple_approx_qkv_attention,
+    stochastic_approx_qkv_attention, batched_stochastic_approx_qkv_attention,
+    adaptive_stochastic_approx_qkv_attention, batched_adaptive_stochastic_approx_qkv_attention,
+    log_expected_query_mass
+)
 
 def generate_sphere_data(key: PRNGKey, n_samples: int = 256) -> jnp.ndarray:
     """Generate unit vectors uniformly distributed on a 3D sphere."""
@@ -488,7 +494,7 @@ def run_weighted_clustering():
     
     # Perform spherical clustering with weighted means
     print(f"Performing weighted spherical clustering (levels={levels})...")
-    centers, clustered_data = cluster_spherical(data, levels=levels)
+    centers, log_weights, clustered_data = cluster_spherical(data, levels=levels)  # vs=None case still returns 3 values
     
     # Calculate exponential magnitudes for alpha values and normalize vectors
     flat_data = clustered_data.reshape(n_samples, -1)
@@ -525,6 +531,14 @@ def run_weighted_clustering():
     for i in range(n_clusters):
         cluster_weights[i] = np.sum(exp_magnitudes[cluster_labels == i])
     
+    # Convert returned log_weights to weights for comparison
+    # Get just the leaf node log_weights from the full tree
+    n_nodes = log_weights.shape[0]
+    n_leaf_nodes = n_clusters
+    leaf_start_idx = n_nodes - n_leaf_nodes
+    leaf_log_weights = log_weights[leaf_start_idx:]
+    returned_weights = np.exp(leaf_log_weights)
+    
     # Get center magnitudes
     n_centers = centers.shape[0]  # Calculate the total number of centers
     leaf_centers = centers[n_centers - n_clusters:]
@@ -548,6 +562,21 @@ def run_weighted_clustering():
     print(f"  Max cluster exp-weight: {np.max(cluster_weights):.2f}")
     print(f"  Exp-weight std dev: {np.std(cluster_weights):.2f}")
     print(f"  Exp-weight ratio (max/min): {np.max(cluster_weights)/np.min(cluster_weights):.2f}")
+    print("\nReturned log-weights statistics:")
+    print(f"  Min returned exp-weight: {np.min(returned_weights):.2f}")
+    print(f"  Max returned exp-weight: {np.max(returned_weights):.2f}")
+    print(f"  Returned exp-weight std dev: {np.std(returned_weights):.2f}")
+    print(f"  Returned/computed weight ratio: {np.mean(returned_weights/cluster_weights):.4f}")
+    
+    # Print hierarchical log-weights information
+    print("\nHierarchical log-weights structure:")
+    # Calculate number of nodes at each level
+    for level in range(levels + 1):
+        start_idx = 2**level - 1
+        end_idx = 2**(level+1) - 1
+        level_weights = np.exp(log_weights[start_idx:end_idx])
+        print(f"  Level {level}: nodes {start_idx}-{end_idx-1}, mean weight: {np.mean(level_weights):.2f}")
+    
     print("\nCenter statistics:")
     print(f"  Min center magnitude: {np.min(center_magnitudes):.4f}")
     print(f"  Max center magnitude: {np.max(center_magnitudes):.4f}")
@@ -563,12 +592,974 @@ def run_weighted_clustering():
     print(f"\nDone! Results saved to 'weighted_hierarchical_clustering_sphere_result.png'")
     print(f"Created {2**levels} = {n_clusters} clusters with {n_samples} points with varying magnitudes")
 
+def run_clustering_with_values():
+    """Demonstrate clustering with both xs and vs arrays."""
+    # Set random seed for reproducibility
+    key = PRNGKey(44)  # Different seed
+    
+    # Generate data vectors and companion values
+    levels = 3  # 2^3 = 8 clusters (small number for clarity)
+    n_samples = 2**7  # 128 points
+    print(f"Generating {n_samples} vectors with varying magnitudes and companion values...")
+    
+    # Generate xs vectors (3D)
+    key1, key2 = jax.random.split(key)
+    xs_data = generate_weighted_sphere_data(key1, n_samples=n_samples)
+    
+    # Generate vs values (2D for simplicity)
+    vs_data = jax.random.normal(key2, (n_samples, 2))
+    
+    # Perform clustering with both xs and vs
+    print(f"Performing spherical clustering with companion values (levels={levels})...")
+    centers, log_weights, weighted_means, clustered_xs, clustered_vs = cluster_spherical(xs_data, levels=levels, vs=vs_data)
+    
+    # Print basic statistics
+    n_clusters = clustered_xs.shape[0]
+    n_points_per_cluster = clustered_xs.shape[1]
+    
+    print("\nClustering with companion values:")
+    print(f"  Number of clusters: {n_clusters}")
+    print(f"  Points per cluster: {n_points_per_cluster}")
+    print(f"  xs shape: {clustered_xs.shape}")
+    print(f"  vs shape: {clustered_vs.shape}")
+    
+    # Print hierarchical log-weights information
+    print("\n  Hierarchical log-weights structure:")
+    # Calculate number of nodes at each level
+    for level in range(levels + 1):
+        start_idx = 2**level - 1
+        end_idx = 2**(level+1) - 1
+        level_weights = np.exp(log_weights[start_idx:end_idx])
+        print(f"    Level {level}: nodes {start_idx}-{end_idx-1}, mean weight: {np.mean(level_weights):.2f}")
+    
+    # Calculate correlation between xs and vs within clusters
+    for i in range(n_clusters):
+        cluster_xs = clustered_xs[i]
+        cluster_vs = clustered_vs[i]
+        
+        # Calculate xs magnitudes
+        xs_mags = np.sqrt(np.sum(cluster_xs**2, axis=1))
+        
+        # Calculate vs magnitudes
+        vs_mags = np.sqrt(np.sum(cluster_vs**2, axis=1))
+        
+        # Calculate correlation
+        correlation = np.corrcoef(xs_mags, vs_mags)[0, 1]
+        print(f"  Cluster {i}: xs-vs magnitude correlation: {correlation:.4f}")
+    
+    print(f"\nDone! Demonstrated clustering with companion values.")
+
+def run_hierarchical_attention_demo():
+    """Demonstrate the sub-quadratic attention algorithm using hierarchical clustering."""
+    # Set random seed for reproducibility
+    key = PRNGKey(45)
+    
+    # Generate data for demonstration
+    dim = 64  # Vector dimension
+    n_samples = 2**10  # 1024 points
+    levels = 5  # 2^5 = 32 clusters
+    
+    print(f"Running hierarchical attention demo with {n_samples} vectors of dimension {dim}")
+    
+    # Generate keys with varying magnitudes
+    key1, key2, key3 = jax.random.split(key, 3)
+    keys = jax.random.normal(key1, (n_samples, dim))
+    keys = keys / jnp.sqrt(jnp.sum(keys**2, axis=1, keepdims=True))  # Normalize
+    
+    # Generate random values
+    values = jax.random.normal(key2, (n_samples, 32))  # 32-dim values
+    
+    # Generate a few test queries
+    n_queries = 5
+    queries = jax.random.normal(key3, (n_queries, dim))
+    queries = queries / jnp.sqrt(jnp.sum(queries**2, axis=1, keepdims=True))  # Normalize
+    
+    # Cluster the keys and values together
+    print(f"Performing hierarchical clustering (levels={levels})...")
+    centers, log_weights, weighted_means, clustered_keys, clustered_values = cluster_spherical(
+        keys, levels=levels, vs=values)
+    
+    # Get dimensions
+    n_clusters = 2**levels
+    n_per_cluster = n_samples // n_clusters
+    
+    # Print information about weighted means
+    print(f"  Tree structure: {n_clusters} leaf nodes, {centers.shape[0]} total nodes")
+    print(f"  Weighted means shape: {weighted_means.shape}")
+    print(f"  Log weights shape: {log_weights.shape}")
+    
+    print("Computing exact attention (baseline)...")
+    # Compute exact attention for comparison (baseline)
+    exact_results = []
+    for q in range(n_queries):
+        query = queries[q]
+        
+        # Standard attention formula
+        scores = jnp.exp(jnp.dot(keys, query))  # [n_samples]
+        # Ensure proper shape for weighted sum
+        weighted_sum = jnp.sum(scores[:, None] * values, axis=0)  # Sum across samples
+        normalization = jnp.sum(scores)
+        exact_result = weighted_sum / normalization
+        exact_results.append(exact_result)
+    
+    exact_results = jnp.stack(exact_results)
+    
+    print("Computing approximate attention using hierarchical clustering...")
+    print("  Standard approach: Only compute exact attention for top-scoring leaf clusters")
+    print("  Residual approach: Also approximate pruned subtrees using precomputed weighted means")
+    
+    # Try different beam widths and with/without residual approximation
+    beam_widths = [1, 2, 4, 8]
+    approx_results = []
+    approx_with_residual_results = []
+    
+    for beam_width in beam_widths:
+        # Without residual approximation (no weighted means)
+        approx_result = batched_approx_qkv_attention(
+            queries, centers, log_weights, clustered_keys, clustered_values, 
+            weighted_means=None, beam_width=beam_width)
+        approx_results.append(approx_result)
+        
+        # With residual approximation (using weighted means)
+        approx_with_residual = batched_approx_qkv_attention(
+            queries, centers, log_weights, clustered_keys, clustered_values, 
+            weighted_means=weighted_means, beam_width=beam_width)
+        approx_with_residual_results.append(approx_with_residual)
+    
+    # Compute error metrics
+    print("\nError comparison for different beam widths:")
+    for i, beam_width in enumerate(beam_widths):
+        # Standard approach errors
+        errors = []
+        # Residual approach errors
+        residual_errors = []
+        
+        for q in range(n_queries):
+            exact = exact_results[q]
+            approx = approx_results[i][q]
+            approx_residual = approx_with_residual_results[i][q]
+            
+            # Make sure shapes match - data outputs might have different shapes
+            # This ensures we're comparing vectors of the same dimension
+            if exact.shape != approx.shape:
+                print(f"Warning: Shape mismatch - exact: {exact.shape}, approx: {approx.shape}")
+                # Reshape if needed or pad/truncate as appropriate
+                # For now, we'll convert both to 1D arrays if they have different shapes
+                exact_flat = exact.flatten()
+                approx_flat = approx.flatten()
+                # Ensure same length by padding or truncating
+                min_len = min(len(exact_flat), len(approx_flat))
+                exact_flat = exact_flat[:min_len]
+                approx_flat = approx_flat[:min_len]
+                
+                # Compute relative error on flattened arrays
+                error = jnp.sqrt(jnp.sum((exact_flat - approx_flat)**2)) / jnp.sqrt(jnp.sum(exact_flat**2))
+                
+                # Do the same for residual error
+                approx_residual_flat = approx_residual.flatten()[:min_len]
+                residual_error = jnp.sqrt(jnp.sum((exact_flat - approx_residual_flat)**2)) / jnp.sqrt(jnp.sum(exact_flat**2))
+            else:
+                # Shapes match, compute errors normally
+                error = jnp.sqrt(jnp.sum((exact - approx)**2)) / jnp.sqrt(jnp.sum(exact**2))
+                residual_error = jnp.sqrt(jnp.sum((exact - approx_residual)**2)) / jnp.sqrt(jnp.sum(exact**2))
+            
+            errors.append(error)
+            residual_errors.append(residual_error)
+        
+        mean_error = jnp.mean(jnp.array(errors))
+        mean_residual_error = jnp.mean(jnp.array(residual_errors))
+        
+        print(f"  Beam width {beam_width}:")
+        print(f"    Standard approach: mean relative error = {mean_error:.6f}")
+        print(f"    With residual approximation: mean relative error = {mean_residual_error:.6f}")
+        print(f"    Improvement: {(1 - mean_residual_error/mean_error)*100:.2f}%")
+    
+    # Estimate computational savings
+    total_keys = n_samples
+    keys_per_query = n_clusters * n_per_cluster // beam_widths[-1]  # for largest beam width
+    
+    print(f"\nComputational comparison:")
+    print(f"  Total keys: {total_keys}")
+    print(f"  Hierarchical clusters: {n_clusters} clusters with {n_per_cluster} keys each")
+    print(f"  Approx. keys processed per query (beam={beam_widths[-1]}): ~{keys_per_query}")
+    print(f"  Speedup factor: ~{total_keys / keys_per_query:.1f}x")
+    
+    print(f"\nDone! Demonstrated sub-quadratic attention using hierarchical clustering")
+
 def main():
     # Run standard clustering on unit vectors
     run_standard_clustering()
     
     # Run weighted clustering on vectors with varying magnitudes
     run_weighted_clustering()
+    
+    # Run clustering with companion values
+    run_clustering_with_values()
+    
+    # Run hierarchical attention demo
+    run_hierarchical_attention_demo()
+
+    # Run simplified JAX attention demo
+    run_simplified_jax_attention_demo()
+
+
+def run_stochastic_attention_demo():
+    """Demonstrate the stochastic sampling approach to hierarchical attention."""
+    # Set random seed for reproducibility
+    key = PRNGKey(47)
+    
+    # Generate data for demonstration
+    dim = 64  # Vector dimension
+    n_samples = 2**10  # 1024 points
+    levels = 5  # 2^5 = 32 clusters
+    
+    print(f"Running stochastic sampling hierarchical attention demo")
+    print(f"Using {n_samples} vectors of dimension {dim}, with {2**levels} clusters")
+    
+    # Generate keys with varying magnitudes
+    key1, key2, key3, key4 = jax.random.split(key, 4)
+    keys = jax.random.normal(key1, (n_samples, dim))
+    keys = keys / jnp.sqrt(jnp.sum(keys**2, axis=1, keepdims=True))  # Normalize
+    
+    # Generate random values
+    values = jax.random.normal(key2, (n_samples, 32))  # 32-dim values
+    
+    # Generate a few test queries
+    n_queries = 5
+    queries = jax.random.normal(key3, (n_queries, dim))
+    queries = queries / jnp.sqrt(jnp.sum(queries**2, axis=1, keepdims=True))  # Normalize
+    
+    # Cluster the keys and values together
+    print(f"Performing hierarchical clustering (levels={levels})...")
+    centers, log_weights, weighted_means, clustered_keys, clustered_values = cluster_spherical(
+        keys, levels=levels, vs=values)
+    
+    # Print tree statistics
+    n_clusters = 2**levels
+    print(f"  Tree structure: {n_clusters} leaf clusters, {centers.shape[0]} total nodes")
+    
+    # Compute exact attention for comparison (baseline)
+    print("Computing exact attention (baseline)...")
+    exact_results = []
+    for q in range(n_queries):
+        query = queries[q]
+        scores = jnp.exp(jnp.dot(keys, query))
+        weighted_sum = jnp.sum(scores[:, None] * values, axis=0)
+        normalization = jnp.sum(scores)
+        exact_results.append(weighted_sum / normalization)
+    
+    exact_results = jnp.stack(exact_results)
+    
+    # Compare different attention methods
+    methods = [
+        ("Deterministic (simplified)", 
+         lambda: batched_simple_approx_qkv_attention(
+             queries, centers, log_weights, clustered_keys, clustered_values, weighted_means)),
+        ("Stochastic (T=0.1)", 
+         lambda: batched_stochastic_approx_qkv_attention(
+             queries, centers, log_weights, clustered_keys, clustered_values, weighted_means, 0.1, key4)),
+        ("Stochastic (T=0.5)", 
+         lambda: batched_stochastic_approx_qkv_attention(
+             queries, centers, log_weights, clustered_keys, clustered_values, weighted_means, 0.5, key4)),
+        ("Stochastic (T=1.0)", 
+         lambda: batched_stochastic_approx_qkv_attention(
+             queries, centers, log_weights, clustered_keys, clustered_values, weighted_means, 1.0, key4)),
+        ("Stochastic (T=2.0)", 
+         lambda: batched_stochastic_approx_qkv_attention(
+             queries, centers, log_weights, clustered_keys, clustered_values, weighted_means, 2.0, key4)),
+        ("Stochastic (T=5.0)", 
+         lambda: batched_stochastic_approx_qkv_attention(
+             queries, centers, log_weights, clustered_keys, clustered_values, weighted_means, 5.0, key4))
+    ]
+    
+    # Storage for results
+    all_results = []
+    execution_times = []
+    errors = []
+    
+    # First do a warmup run to compile everything
+    print("\nWarming up JIT compilation...")
+    batched_simple_approx_qkv_attention(
+        queries, centers, log_weights, clustered_keys, clustered_values, weighted_means)
+    batched_stochastic_approx_qkv_attention(
+        queries, centers, log_weights, clustered_keys, clustered_values, weighted_means, 1.0, key4)
+    
+    # Run all methods
+    print("\nComparing different attention methods:")
+    import time
+    
+    for name, method_fn in methods:
+        print(f"\n{name}:")
+        # Measure execution time
+        start_time = time.time()
+        results = method_fn()
+        execution_time = time.time() - start_time
+        
+        # Store results
+        all_results.append(results)
+        execution_times.append(execution_time)
+        
+        # Calculate errors
+        method_errors = []
+        for q in range(n_queries):
+            exact = exact_results[q]
+            approx = results[q]
+            
+            # Ensure shapes match for error calculation
+            if exact.shape != approx.shape:
+                print(f"  Warning: Shape mismatch - exact: {exact.shape}, approx: {approx.shape}")
+                exact_flat = exact.flatten()
+                approx_flat = approx.flatten()
+                min_len = min(len(exact_flat), len(approx_flat))
+                exact_flat = exact_flat[:min_len]
+                approx_flat = approx_flat[:min_len]
+                error = jnp.sqrt(jnp.sum((exact_flat - approx_flat)**2)) / jnp.sqrt(jnp.sum(exact_flat**2))
+            else:
+                error = jnp.sqrt(jnp.sum((exact - approx)**2)) / jnp.sqrt(jnp.sum(exact**2))
+            
+            method_errors.append(error)
+        
+        mean_error = jnp.mean(jnp.array(method_errors))
+        errors.append(mean_error)
+        
+        # Print statistics
+        print(f"  Execution time: {execution_time:.6f} seconds ({n_queries/execution_time:.1f} queries/sec)")
+        print(f"  Mean relative error: {mean_error:.6f}")
+    
+    # Print summary comparison
+    print("\nMethod comparison summary:")
+    print(f"{'Method':<20} {'Error':<10} {'Relative Speed':<15} {'Queries/sec':<12}")
+    print("-" * 60)
+    
+    baseline_time = execution_times[0]  # Use deterministic as baseline
+    for i, (name, _) in enumerate(methods):
+        relative_speed = baseline_time / execution_times[i]
+        queries_per_sec = n_queries / execution_times[i]
+        print(f"{name:<20} {errors[i]:<10.6f} {relative_speed:<15.2f}x {queries_per_sec:<12.1f}")
+    
+    # Create error vs. temperature plot (skip the deterministic method)
+    stochastic_temps = [0.1, 0.5, 1.0, 2.0, 5.0]
+    stochastic_errors = errors[1:]  # Skip deterministic
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(stochastic_temps, stochastic_errors, 'o-', linewidth=2)
+    plt.axhline(y=errors[0], color='r', linestyle='--', label=f'Deterministic Error ({errors[0]:.6f})')
+    plt.xlabel('Temperature')
+    plt.ylabel('Mean Relative Error')
+    plt.title('Effect of Temperature on Stochastic Attention Error')
+    plt.grid(True)
+    plt.legend()
+    plt.xscale('log')  # Log scale for temperature
+    plt.savefig('stochastic_attention_errors.png', dpi=300)
+    
+    print(f"\nDone! Error vs. temperature plot saved to 'stochastic_attention_errors.png'")
+    print(f"Key observations:")
+    
+    if min(errors[1:]) < errors[0]:
+        best_temp_idx = np.argmin(errors[1:])
+        best_temp = stochastic_temps[best_temp_idx]
+        improvement = (1 - min(errors[1:]) / errors[0]) * 100
+        print(f"- Stochastic sampling with T={best_temp} improves accuracy by {improvement:.2f}%")
+    else:
+        print(f"- Deterministic selection provides the best accuracy in this test case")
+    
+    # Check if there's a trend in errors vs temperature
+    if errors[1] < errors[-1]:
+        print(f"- Lower temperatures perform better (more exploitation)")
+    elif errors[-1] < errors[1]:
+        print(f"- Higher temperatures perform better (more exploration)")
+    else:
+        print(f"- No clear trend between temperature and error")
+    
+    # Compare speed
+    if min(execution_times[1:]) < execution_times[0]:
+        print(f"- Stochastic approach can be faster than deterministic in some cases")
+    else:
+        print(f"- Deterministic approach is faster than stochastic sampling")
+    
+    print("\nNote: For gradient quality during training, the stochastic approach may provide")
+    print("benefits beyond what is measured by simple error metrics, particularly for")
+    print("avoiding local minima and improving generalization.")
+
+
+def run_adaptive_stochastic_attention_demo():
+    """Compare regular stochastic sampling with adaptive residual weighting."""
+    # Set random seed for reproducibility
+    key = PRNGKey(48)
+    
+    # Generate data for demonstration
+    dim = 64  # Vector dimension
+    n_samples = 2**10  # 1024 points
+    levels = 5  # 2^5 = 32 clusters
+    
+    print(f"Running adaptive vs. standard stochastic attention comparison")
+    print(f"Using {n_samples} vectors of dimension {dim}, with {2**levels} clusters")
+    
+    # Generate keys with more concentrated distribution to create higher attention variability
+    # We'll create several concentrated clusters of keys to simulate more realistic attention patterns
+    key1, key2, key3, key4, key5 = jax.random.split(key, 5)
+    
+    # Number of synthetic clusters to generate
+    n_synthetic_clusters = 8
+    points_per_cluster = n_samples // n_synthetic_clusters
+    leftover_points = n_samples - (points_per_cluster * n_synthetic_clusters)
+    
+    # Generate synthetic cluster centers
+    cluster_centers = jax.random.normal(key1, (n_synthetic_clusters, dim))
+    cluster_centers = cluster_centers / jnp.sqrt(jnp.sum(cluster_centers**2, axis=1, keepdims=True))
+    
+    # Generate concentration factors (higher = more concentrated clusters)
+    # Using different concentration levels creates more variability in attention patterns
+    concentrations = jnp.array([5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0])
+    
+    # Function to generate vMF-distributed points (von Mises-Fisher)
+    def generate_vmf_points(center, kappa, n_points, key):
+        # Generate points concentrated around center with given kappa (concentration)
+        center_dim = center.shape[0]
+        
+        # Step 1: Generate samples from a uniform distribution on a hypersphere cap
+        key1, key2 = jax.random.split(key)
+        
+        # Sample from the angular distribution
+        w = 1.0 + jnp.log(jax.random.uniform(key1, (n_points,))) / kappa
+        
+        # Generate random direction vectors orthogonal to center
+        v = jax.random.normal(key2, (n_points, center_dim))
+        
+        # Make v orthogonal to center - properly vectorized version
+        # Need to properly reshape center for broadcasting with each row of v
+        center_reshaped = center.reshape(1, -1)  # Shape: (1, center_dim)
+        dot_products = jnp.sum(v * center_reshaped, axis=1, keepdims=True)  # Shape: (n_points, 1)
+        v = v - dot_products * center_reshaped  # Now broadcasts correctly
+        
+        # Normalize v - avoid division by zero
+        v_norms = jnp.sqrt(jnp.sum(v**2, axis=1, keepdims=True))
+        v = v / jnp.maximum(v_norms, 1e-10)  # Safe normalization
+        
+        # Combine to get the result (points on sphere concentrated around center)
+        x = w[:, jnp.newaxis] * center_reshaped + jnp.sqrt(1 - w[:, jnp.newaxis]**2) * v
+        
+        return x
+    
+    # Generate points for each synthetic cluster with different concentrations
+    all_keys = []
+    cluster_keys = []
+    
+    for i in range(n_synthetic_clusters):
+        n_points = points_per_cluster + (1 if i < leftover_points else 0)
+        key5, subkey = jax.random.split(key5)
+        
+        # Generate concentrated points
+        cluster_points = generate_vmf_points(
+            cluster_centers[i], concentrations[i], n_points, subkey)
+        
+        all_keys.append(cluster_points)
+        cluster_keys.extend([i] * n_points)  # Track which synthetic cluster each point belongs to
+    
+    # Combine all clusters
+    keys = jnp.vstack(all_keys)
+    
+    # Double-check normalization
+    keys = keys / jnp.sqrt(jnp.sum(keys**2, axis=1, keepdims=True))
+    
+    print(f"  Created {n_synthetic_clusters} synthetic clusters with varying concentrations:")
+    for i in range(n_synthetic_clusters):
+        print(f"    Cluster {i+1}: concentration={concentrations[i]:.1f}")
+    
+    # Generate random values
+    values = jax.random.normal(key2, (n_samples, 32))  # 32-dim values
+    
+    # Generate test queries
+    # Generate queries that are biased toward some of the synthetic clusters
+    # to create situations where attention is more concentrated
+    n_queries = 10  # More queries for better statistics
+    
+    # Mix of random queries and queries near cluster centers
+    query_centers = cluster_centers[jnp.array([0, 2, 4, 7])]  # Select a subset of clusters
+    
+    # Generate some queries near the selected centers and some random ones
+    near_center_queries = []
+    for i, center in enumerate(query_centers):
+        key3, subkey = jax.random.split(key3)
+        # Generate 2 queries near each selected center with moderate concentration
+        near_center_points = generate_vmf_points(center, 20.0, 2, subkey)
+        near_center_queries.append(near_center_points)
+    
+    # 2 random queries
+    key3, subkey = jax.random.split(key3)
+    random_queries = jax.random.normal(subkey, (2, dim))
+    random_queries = random_queries / jnp.sqrt(jnp.sum(random_queries**2, axis=1, keepdims=True))
+    
+    # Combine queries
+    queries = jnp.vstack([jnp.vstack(near_center_queries), random_queries])
+    
+    # Ensure we have exactly n_queries
+    queries = queries[:n_queries]
+    
+    # Ensure unit length
+    queries = queries / jnp.sqrt(jnp.sum(queries**2, axis=1, keepdims=True))
+    
+    # Cluster the keys and values together
+    print(f"Performing hierarchical clustering (levels={levels})...")
+    centers, log_weights, weighted_means, clustered_keys, clustered_values = cluster_spherical(
+        keys, levels=levels, vs=values)
+    
+    # Print tree statistics
+    n_clusters = 2**levels
+    print(f"  Tree structure: {n_clusters} leaf clusters, {centers.shape[0]} total nodes")
+    
+    # Compute exact attention for comparison (baseline)
+    print("Computing exact attention (baseline)...")
+    exact_results = []
+    for q in range(n_queries):
+        query = queries[q]
+        scores = jnp.exp(jnp.dot(keys, query))
+        weighted_sum = jnp.sum(scores[:, None] * values, axis=0)
+        normalization = jnp.sum(scores)
+        exact_results.append(weighted_sum / normalization)
+    
+    exact_results = jnp.stack(exact_results)
+    
+    # Temperature values to test
+    temps = [0.1, 0.5, 1.0, 2.0, 5.0]
+    
+    # Initialize results storage
+    standard_errors = []
+    adaptive_errors = []
+    standard_times = []
+    adaptive_times = []
+    mass_ratios = []  # Average mass in best cluster
+    max_mass_ratios = []  # Maximum mass in best cluster
+    top_two_mass_ratios = []  # Average mass in top two clusters
+    
+    # First do a warmup run to compile everything
+    print("\nWarming up JIT compilation...")
+    batched_stochastic_approx_qkv_attention(
+        queries[:1], centers, log_weights, clustered_keys, clustered_values, weighted_means, 1.0, key4)
+    batched_adaptive_stochastic_approx_qkv_attention(
+        queries[:1], centers, log_weights, clustered_keys, clustered_values, weighted_means, 1.0, key4)
+    
+    # Import time for measurements
+    import time
+    
+    # Run tests for all temperature values
+    print("\nRunning comparisons across temperature values:")
+    
+    for temp in temps:
+        print(f"\nTemperature: {temp}")
+        
+        # Create a new key for this temperature
+        temp_key = jax.random.fold_in(key4, int(temp * 100))
+        
+        # 1. Test standard stochastic approach
+        start_time = time.time()
+        standard_results = batched_stochastic_approx_qkv_attention(
+            queries, centers, log_weights, clustered_keys, clustered_values, 
+            weighted_means, temp, temp_key)
+        standard_time = time.time() - start_time
+        standard_times.append(standard_time)
+        
+        # 2. Test adaptive stochastic approach
+        start_time = time.time()
+        adaptive_results = batched_adaptive_stochastic_approx_qkv_attention(
+            queries, centers, log_weights, clustered_keys, clustered_values, 
+            weighted_means, temp, temp_key)
+        adaptive_time = time.time() - start_time
+        adaptive_times.append(adaptive_time)
+        
+        # Calculate errors for each query
+        standard_query_errors = []
+        adaptive_query_errors = []
+        
+        for q in range(n_queries):
+            exact = exact_results[q]
+            std_approx = standard_results[q]
+            adapt_approx = adaptive_results[q]
+            
+            # Compute relative errors
+            std_error = jnp.sqrt(jnp.sum((exact - std_approx)**2)) / jnp.sqrt(jnp.sum(exact**2))
+            adapt_error = jnp.sqrt(jnp.sum((exact - adapt_approx)**2)) / jnp.sqrt(jnp.sum(exact**2))
+            
+            standard_query_errors.append(std_error)
+            adaptive_query_errors.append(adapt_error)
+        
+        # Calculate average errors
+        standard_error = jnp.mean(jnp.array(standard_query_errors))
+        adaptive_error = jnp.mean(jnp.array(adaptive_query_errors))
+        
+        standard_errors.append(standard_error)
+        adaptive_errors.append(adaptive_error)
+        
+        # Print results for this temperature
+        speed_ratio = standard_time / adaptive_time
+        error_improvement = (1 - adaptive_error / standard_error) * 100
+        print(f"  Standard: Error={standard_error:.6f}, Time={standard_time:.6f}s")
+        print(f"  Adaptive: Error={adaptive_error:.6f}, Time={adaptive_time:.6f}s")
+        print(f"  Improvement: {error_improvement:.2f}% error reduction")
+        print(f"  Speed: {speed_ratio:.2f}x ({adaptive_time/standard_time:.2f}x)")
+        
+        # Calculate attention mass capture statistics for this temperature
+        # Check attention mass distribution for all queries
+        leaf_start_idx = centers.shape[0] - clustered_keys.shape[0]
+        leaf_nodes = jnp.arange(clustered_keys.shape[0]) + leaf_start_idx
+        
+        query_mass_ratios = []
+        query_best_two_ratios = []
+        
+        for q_idx in range(n_queries):
+            query = queries[q_idx]
+            
+            # Calculate leaf scores for this query
+            def score_node(node_idx):
+                centroid = centers[node_idx]
+                return log_expected_query_mass(query, centroid) + log_weights[node_idx]
+            
+            leaf_scores = jax.vmap(score_node)(leaf_nodes)
+            
+            # Find the best leaf
+            best_leaf_idx = jnp.argmax(leaf_scores)
+            
+            # Convert scores to probabilities (numerically stable)
+            exp_leaf_scores = jnp.exp(leaf_scores - jnp.max(leaf_scores))
+            total_leaf_mass = jnp.sum(exp_leaf_scores)
+            
+            # Estimate mass captured by best cluster
+            best_mass_ratio = exp_leaf_scores[best_leaf_idx] / total_leaf_mass
+            query_mass_ratios.append(best_mass_ratio)
+            
+            # Also calculate mass captured by top two clusters
+            sorted_indices = jnp.argsort(-leaf_scores)  # Sort in descending order
+            top_two_indices = sorted_indices[:2]
+            top_two_mass = (exp_leaf_scores[top_two_indices[0]] + 
+                           exp_leaf_scores[top_two_indices[1]]) / total_leaf_mass
+            query_best_two_ratios.append(top_two_mass)
+        
+        # Average and max ratios across queries
+        avg_best_mass_ratio = jnp.mean(jnp.array(query_mass_ratios)) 
+        max_best_mass_ratio = jnp.max(jnp.array(query_mass_ratios))
+        avg_best_two_ratio = jnp.mean(jnp.array(query_best_two_ratios))
+        
+        # Store various metrics for plotting
+        mass_ratios.append(avg_best_mass_ratio)
+        max_mass_ratios.append(max_best_mass_ratio)
+        top_two_mass_ratios.append(avg_best_two_ratio)
+        
+        # Analyze the attention distribution per query
+        gini_coefficients = []
+        effective_clusters = []
+        
+        for q_idx in range(n_queries):
+            query = queries[q_idx]
+            
+            # Get leaf scores for this query
+            def score_node(node_idx):
+                centroid = centers[node_idx]
+                return log_expected_query_mass(query, centroid) + log_weights[node_idx]
+            
+            leaf_scores = jax.vmap(score_node)(leaf_nodes)
+            exp_leaf_scores = jnp.exp(leaf_scores - jnp.max(leaf_scores))
+            probs = exp_leaf_scores / jnp.sum(exp_leaf_scores)
+            
+            # Sort probabilities in descending order for analysis
+            sorted_probs = jnp.sort(probs)[::-1]
+            
+            # Calculate Gini coefficient (measure of inequality)
+            # Higher values mean more concentrated distribution
+            n = len(sorted_probs)
+            indices = jnp.arange(1, n+1)
+            gini = 1 - 2 * jnp.sum((n + 1 - indices) * sorted_probs) / (n * jnp.sum(sorted_probs))
+            gini_coefficients.append(gini)
+            
+            # Calculate effective number of clusters (1/sum of squared probs)
+            effective_n = 1.0 / jnp.sum(probs**2)
+            effective_clusters.append(effective_n)
+        
+        avg_gini = jnp.mean(jnp.array(gini_coefficients))
+        avg_effective_n = jnp.mean(jnp.array(effective_clusters))
+        
+        print(f"  Attention concentration statistics:")
+        print(f"    Best cluster mass: avg={avg_best_mass_ratio:.2%}, max={max_best_mass_ratio:.2%}")
+        print(f"    Top 2 clusters mass: avg={avg_best_two_ratio:.2%}")
+        print(f"    Gini coefficient: {avg_gini:.4f} (higher = more concentrated)")
+        print(f"    Effective # of clusters: {avg_effective_n:.1f} of {n_clusters} total")
+    
+    # Create comparison plot
+    plt.figure(figsize=(12, 8))
+    
+    # Error subplot
+    plt.subplot(2, 1, 1)
+    plt.plot(temps, standard_errors, 'o-', label="Standard Stochastic", linewidth=2)
+    plt.plot(temps, adaptive_errors, 's-', label="Adaptive Residual Weighting", linewidth=2)
+    plt.xlabel("Temperature")
+    plt.ylabel("Mean Relative Error")
+    plt.title("Error Comparison: Standard vs. Adaptive Stochastic Attention")
+    plt.grid(True)
+    plt.legend()
+    plt.xscale('log')
+    
+    # Speed subplot
+    plt.subplot(2, 1, 2)
+    relative_speedup = [standard_times[i] / adaptive_times[i] for i in range(len(temps))]
+    plt.plot(temps, relative_speedup, 'o-', color='green', linewidth=2)
+    plt.axhline(y=1.0, color='r', linestyle='--', label='Equal Speed')
+    plt.xlabel("Temperature")
+    plt.ylabel("Relative Speed (>1 means Adaptive is faster)")
+    plt.title("Speed Comparison: Adaptive vs. Standard (ratio of execution times)")
+    plt.grid(True)
+    plt.xscale('log')
+    
+    plt.tight_layout()
+    plt.savefig('adaptive_vs_standard_comparison.png', dpi=300)
+    
+    # Create a second plot showing error reduction and attention mass metrics
+    plt.figure(figsize=(10, 6))
+    
+    # Primary axis: Error reduction
+    error_reduction = [(1 - adaptive_errors[i] / standard_errors[i]) * 100 for i in range(len(temps))]
+    plt.plot(temps, error_reduction, 'o-', color='blue', linewidth=2, label="Error Reduction")
+    
+    # Secondary axis: Attention mass distributions
+    ax2 = plt.gca().twinx()
+    ax2.plot(temps, [m * 100 for m in mass_ratios], 's-', color='red', linewidth=2, label="Avg Best Cluster Mass")
+    ax2.plot(temps, [m * 100 for m in max_mass_ratios], '^-', color='darkred', linewidth=2, label="Max Best Cluster Mass")
+    ax2.plot(temps, [m * 100 for m in top_two_mass_ratios], 'd-', color='orange', linewidth=2, label="Avg Top-2 Clusters Mass")
+    
+    # Labels and formatting
+    plt.xlabel("Temperature")
+    plt.ylabel("Error Reduction (%)")
+    ax2.set_ylabel("Attention Mass (%)")
+    plt.title("Adaptive Weighting: Error Reduction vs. Attention Mass Distribution")
+    plt.grid(True)
+    plt.xscale('log')
+    
+    # Combined legend
+    lines1, labels1 = plt.gca().get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax2.legend(lines1 + lines2, labels1 + labels2, loc='best')
+    
+    plt.tight_layout()
+    plt.savefig('adaptive_weighting_analysis.png', dpi=300)
+    
+    # Create a third plot focusing on attention concentration patterns
+    plt.figure(figsize=(12, 10))
+    
+    # Create a 2x2 subplot grid
+    plt.subplot(2, 2, 1)
+    plt.plot(temps, error_reduction, 'o-', color='blue', linewidth=2)
+    plt.xlabel("Temperature")
+    plt.ylabel("Error Reduction (%)")
+    plt.title("Error Reduction vs Temperature")
+    plt.grid(True)
+    plt.xscale('log')
+    
+    # Plot mass in best cluster
+    plt.subplot(2, 2, 2)
+    plt.plot(temps, [m * 100 for m in mass_ratios], 's-', color='red', linewidth=2, label="Avg")
+    plt.plot(temps, [m * 100 for m in max_mass_ratios], '^--', color='darkred', linewidth=2, label="Max")
+    plt.xlabel("Temperature")
+    plt.ylabel("Mass in Best Cluster (%)")
+    plt.title("Attention Concentration")
+    plt.legend()
+    plt.grid(True)
+    plt.xscale('log')
+    
+    # Plot correlation between error reduction and mass ratio
+    plt.subplot(2, 2, 3)
+    plt.scatter([m * 100 for m in mass_ratios], error_reduction, c='purple', s=100, alpha=0.7)
+    
+    # Add temperature labels to points
+    for i, temp in enumerate(temps):
+        plt.annotate(f'T={temp}', 
+                    (mass_ratios[i] * 100, error_reduction[i]),
+                    xytext=(5, 5), textcoords='offset points')
+    
+    # Add trend line
+    z = np.polyfit([m * 100 for m in mass_ratios], error_reduction, 1)
+    p = np.poly1d(z)
+    plt.plot([min(m * 100 for m in mass_ratios), max(m * 100 for m in mass_ratios)], 
+             [p(min(m * 100 for m in mass_ratios)), p(max(m * 100 for m in mass_ratios))], 
+             "r--", alpha=0.7)
+    
+    plt.xlabel("Avg Mass in Best Cluster (%)")
+    plt.ylabel("Error Reduction (%)")
+    plt.title("Correlation: Error Reduction vs Attention Concentration")
+    plt.grid(True)
+    
+    # Plot mass in top two clusters
+    plt.subplot(2, 2, 4)
+    plt.plot(temps, [m * 100 for m in top_two_mass_ratios], 'd-', color='orange', linewidth=2)
+    plt.xlabel("Temperature")
+    plt.ylabel("Mass in Top 2 Clusters (%)")
+    plt.title("Top-2 Clusters Attention Concentration")
+    plt.grid(True)
+    plt.xscale('log')
+    
+    plt.tight_layout()
+    plt.savefig('attention_concentration_analysis.png', dpi=300)
+    
+    # Calculate average improvements
+    avg_error_reduction = sum(error_reduction) / len(error_reduction)
+    avg_speedup = sum(relative_speedup) / len(relative_speedup)
+    
+    print("\nSummary Statistics:")
+    print(f"  Average error reduction: {avg_error_reduction:.2f}%")
+    print(f"  Average speed ratio: {avg_speedup:.2f}x")
+    print(f"  Best temperature for adaptive method: {temps[np.argmin(adaptive_errors)]}")
+    print(f"  Best temperature for standard method: {temps[np.argmin(standard_errors)]}")
+    
+    # Theoretical analysis
+    print("\nTheoretical Analysis:")
+    print(f"  Average mass in best cluster: {sum(mass_ratios)/len(mass_ratios):.2%}")
+    
+    # Maximum possible error reduction
+    max_reduction = max(error_reduction)
+    max_reduction_temp = temps[np.argmax(error_reduction)]
+    print(f"  Maximum error reduction: {max_reduction:.2f}% at temperature {max_reduction_temp}")
+    
+    # Correlation between mass ratio and error reduction
+    corr = np.corrcoef(mass_ratios, error_reduction)[0, 1]
+    print(f"  Correlation between mass ratio and error reduction: {corr:.4f}")
+    
+    if corr < -0.5:
+        print("  Strong negative correlation: Adaptive weighting is most effective")
+        print("  when attention mass is distributed across many clusters")
+    elif corr > 0.5:
+        print("  Strong positive correlation: Adaptive weighting is most effective")
+        print("  when attention mass is concentrated in a few clusters")
+    
+    print(f"\nDone! Comparison plots saved to 'adaptive_vs_standard_comparison.png' and 'adaptive_weighting_analysis.png'")
+
+
+def run_simplified_jax_attention_demo():
+    """Demonstrate the JAX-optimized version of hierarchical attention."""
+    # Set random seed for reproducibility
+    key = PRNGKey(46)
+    
+    # Generate data for demonstration
+    dim = 64  # Vector dimension
+    n_samples = 2**10  # 1024 points
+    levels = 5  # 2^5 = 32 clusters
+    
+    print(f"Running JAX-optimized simplified hierarchical attention demo")
+    print(f"Using {n_samples} vectors of dimension {dim}, with {2**levels} clusters")
+    
+    # Generate keys with varying magnitudes
+    key1, key2, key3 = jax.random.split(key, 3)
+    keys = jax.random.normal(key1, (n_samples, dim))
+    keys = keys / jnp.sqrt(jnp.sum(keys**2, axis=1, keepdims=True))  # Normalize
+    
+    # Generate random values
+    values = jax.random.normal(key2, (n_samples, 32))  # 32-dim values
+    
+    # Generate a few test queries
+    n_queries = 5
+    queries = jax.random.normal(key3, (n_queries, dim))
+    queries = queries / jnp.sqrt(jnp.sum(queries**2, axis=1, keepdims=True))  # Normalize
+    
+    # Cluster the keys and values together
+    print(f"Performing hierarchical clustering (levels={levels})...")
+    centers, log_weights, weighted_means, clustered_keys, clustered_values = cluster_spherical(
+        keys, levels=levels, vs=values)
+    
+    # Print tree statistics
+    n_clusters = 2**levels
+    print(f"  Tree structure: {n_clusters} leaf clusters, {centers.shape[0]} total nodes")
+    
+    # Compute exact attention for comparison (baseline)
+    print("Computing exact attention (baseline)...")
+    exact_results = []
+    for q in range(n_queries):
+        query = queries[q]
+        scores = jnp.exp(jnp.dot(keys, query))
+        weighted_sum = jnp.sum(scores[:, None] * values, axis=0)
+        normalization = jnp.sum(scores)
+        exact_results.append(weighted_sum / normalization)
+    
+    exact_results = jnp.stack(exact_results)
+    
+    # Run standard beam search with residual (beam=1)
+    print("Computing standard beam search with residual approximation (beam=1)...")
+    std_beam1_results = batched_approx_qkv_attention(
+        queries, centers, log_weights, clustered_keys, clustered_values,
+        weighted_means=weighted_means, beam_width=1)
+    
+    # Compile and run simplified JAX implementation
+    print("Compiling and running JAX-optimized implementation...")
+    print("  First run includes compilation time...")
+    import time
+    start_time = time.time()
+    jax_results = batched_simple_approx_qkv_attention(
+        queries, centers, log_weights, clustered_keys, clustered_values, weighted_means)
+    compile_time = time.time() - start_time
+    print(f"  Compilation + first execution time: {compile_time:.4f} seconds")
+    
+    # Run again to measure execution time
+    print("  Measuring execution time (post-compilation)...")
+    start_time = time.time()
+    jax_results = batched_simple_approx_qkv_attention(
+        queries, centers, log_weights, clustered_keys, clustered_values, weighted_means)
+    execution_time = time.time() - start_time
+    print(f"  Execution time: {execution_time:.4f} seconds ({n_queries/execution_time:.1f} queries/sec)")
+    
+    # Compute errors for both implementations
+    std_errors = []
+    jax_errors = []
+    
+    for q in range(n_queries):
+        exact = exact_results[q]
+        std_approx = std_beam1_results[q]
+        jax_approx = jax_results[q]
+        
+        # Ensure shapes match for error calculation
+        if exact.shape != std_approx.shape or exact.shape != jax_approx.shape:
+            print(f"Warning: Shape mismatch - exact: {exact.shape}, std: {std_approx.shape}, jax: {jax_approx.shape}")
+            # Use flattened arrays with minimum length
+            exact_flat = exact.flatten()
+            std_flat = std_approx.flatten()
+            jax_flat = jax_approx.flatten()
+            min_len = min(len(exact_flat), len(std_flat), len(jax_flat))
+            
+            # Compute errors on truncated flat arrays
+            std_error = jnp.sqrt(jnp.sum((exact_flat[:min_len] - std_flat[:min_len])**2)) / jnp.sqrt(jnp.sum(exact_flat[:min_len]**2))
+            jax_error = jnp.sqrt(jnp.sum((exact_flat[:min_len] - jax_flat[:min_len])**2)) / jnp.sqrt(jnp.sum(exact_flat[:min_len]**2))
+        else:
+            # Compute errors normally
+            std_error = jnp.sqrt(jnp.sum((exact - std_approx)**2)) / jnp.sqrt(jnp.sum(exact**2))
+            jax_error = jnp.sqrt(jnp.sum((exact - jax_approx)**2)) / jnp.sqrt(jnp.sum(exact**2))
+        
+        std_errors.append(std_error)
+        jax_errors.append(jax_error)
+    
+    # Print error comparison
+    mean_std_error = jnp.mean(jnp.array(std_errors))
+    mean_jax_error = jnp.mean(jnp.array(jax_errors))
+    
+    print("\nError comparison:")
+    print(f"  Standard beam=1 with residual: mean relative error = {mean_std_error:.6f}")
+    print(f"  JAX-optimized implementation: mean relative error = {mean_jax_error:.6f}")
+    
+    if mean_jax_error < mean_std_error:
+        improvement = (1 - mean_jax_error/mean_std_error) * 100
+        print(f"  JAX implementation is more accurate by {improvement:.2f}%")
+    elif mean_std_error < mean_jax_error:
+        degradation = (mean_jax_error/mean_std_error - 1) * 100
+        print(f"  JAX implementation is less accurate by {degradation:.2f}%")
+    else:
+        print("  Both implementations have identical accuracy")
+    
+    # Computational comparison
+    print("\nComputational comparison:")
+    print(f"  Total keys processed in exact attention: {n_samples}")
+    print(f"  Keys processed in simplified attention: {clustered_keys.shape[1]}")
+    print(f"  Speedup factor from keys alone: {n_samples/clustered_keys.shape[1]:.1f}x")
+    print(f"  Additional speedup from JAX optimization and residual approximation")
+    
+    print(f"\nDone! Demonstrated JAX-optimized hierarchical attention")
+
 
 if __name__ == "__main__":
-    main()
+    # Uncomment the function you want to run
+    # main()
+    #run_simplified_jax_attention_demo()
+    #run_stochastic_attention_demo()
+    run_adaptive_stochastic_attention_demo()
