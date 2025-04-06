@@ -1,0 +1,21 @@
+[project]
+name = "concept"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "absl-py>=2.1.0",
+    "chex>=0.1.88",
+    "clu>=0.0.12",
+    "flax>=0.10.4",
+    "jax>=0.5.1",
+    "matplotlib>=3.10.0",
+    "optax>=0.2.4",
+    "pandas>=2.2.3",
+    "pillow>=11.1.0",
+    "scikit-learn>=1.6.1",
+    "tensorflow>=2.18.0",
+    "tensorflow-datasets>=4.9.7",
+    "tqdm>=4.67.1",
+]
