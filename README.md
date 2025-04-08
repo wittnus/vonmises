@@ -2,6 +2,8 @@
 Von-mises fisher distribution for k-means clustering based attention layer.
 The objective of this project is to achieve nlogn complexity in token length for attention layers.
 
+(Remainder of this readme written in substantial part by claude, take with appropriate quantity of salt.)
+
 ## Core Ideas
 
 ### Standard Attention Complexity
