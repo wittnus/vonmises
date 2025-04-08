@@ -89,10 +89,12 @@ When a cluster is better approximated as a spherical shell (keys distributed on 
 - For sphere centered at origin: K(q) = log(I_{d/2-1}(R·||q||)) - (d/2-1)log(R·||q||) + constant
 - For sphere centered at μ, the CGF becomes a function of the offset: K(q) = log(E[exp(q·(μ+Rz))]) where z is uniform on unit sphere
 - To first order: K(q) ≈ q·μ
-- The covariance structure is Σ = (I-μμᵀ/||μ||²)·R²/d, reflecting isotropic variance perpendicular to μ
-- To second order: K(q) ≈ q·μ + (1/2)·qᵀΣq = q·μ + (R²/2d)·[||q||² - (q·μ)²/||μ||²]
-- This captures both the mean direction effect and the anisotropic variance in different directions
+- For a uniform spherical shell, the covariance is isotropic: Σ = (R²/d)·I
+- To second order: K(q) ≈ q·μ + (R²/2d)·||q||²
+- This captures both the mean direction effect (q·μ) and the isotropic variance (R²/2d)·||q||²
 - In high dimensions, the variance term becomes negligible compared to the mean term
+
+Note: For a vMF distribution (which is different from a uniform spherical shell), the covariance has the anisotropic structure Σ = (1-R²)/d·(I-μμᵀ/||μ||²), where R = ||μ|| is related to the concentration parameter.
 
 #### Approximating Clusters with Balls
 When a cluster is better approximated as a ball (keys uniformly distributed in a ball of radius R centered at μ):
