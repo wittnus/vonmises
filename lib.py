@@ -955,6 +955,15 @@ def topk_approx_qkv_attention(query: Array, centers: Array, log_weights: Array,
     
     # Create a mask for the selected leaves
     selected_mask = jnp.zeros(num_centers, dtype=bool)
+
+    # Compute all exact norms for debugging
+    #leaf_exact_norms = jnp.log(jnp.sum(jnp.exp(
+    #    jnp.einsum('lcd,d->lc', clustered_keys, query)
+    #    ), axis=-1))
+
+    # Compute topk with exact norms for debugging
+    #topk_leaf_indices = jnp.argsort(-leaf_exact_norms)[:k]
+    
     
     # Process each top-k cluster and update the selected mask
     for i in range(k):
