@@ -2,6 +2,109 @@
 Von-mises fisher distribution for k-means clustering based attention layer.
 The objective of this project is to achieve nlogn complexity in token length for attention layers.
 
+## Core Ideas
+
+### Standard Attention Complexity
+
+In transformer models, the standard attention mechanism computes:
+
+```
+Attention(Q, K, V) = softmax(QK^T / √d) · V
+```
+
+For sequence length n and embedding dimension d:
+- Computing QK^T requires O(n²d) operations
+- Applying softmax and multiplying by V requires O(n²d) operations
+- Total complexity: O(n²d)
+
+This quadratic complexity in sequence length becomes prohibitively expensive as n grows, limiting the context length of transformer models.
+
+### Clustering-Based Attention Complexity
+
+This project implements attention approximation using von Mises-Fisher clustering:
+
+1. **Preprocessing** (done once for all queries):
+   - Organize keys into a hierarchical binary tree with k = 2^levels clusters
+   - Complexity: O(nd log k)
+
+2. **Query Processing** (per query):
+   - Compute expected attention mass for each cluster: O(kd)
+   - Select top-b clusters (beam width): O(k log b)
+   - Compute exact attention for selected clusters: O(bd * n/k)
+   - Approximate remaining clusters: O(kd)
+   - Total per-query complexity: O(kd + n/k * bd) = O((k + nb/k)d)
+
+When k ≈ √n (optimal clustering):
+- Per-query complexity: O(√n·d)
+- For all n queries: O(n^1.5·d)
+
+This is a significant improvement over the standard O(n²d) complexity, especially for large sequence lengths.
+
+### Achieving O(n log n) Complexity via Hierarchical Beam Search
+
+The hierarchical cluster structure can be further exploited to achieve O(n log n) complexity through hierarchical beam search:
+
+1. **Hierarchical Traversal** instead of flat cluster scoring:
+   - Start at the root of the binary tree
+   - At each level, evaluate only the most promising b nodes (beam width)
+   - Traverse down the tree, maintaining only the top-b candidates at each level
+   - With log k levels and b nodes per level: O(b log k · d)
+
+2. **Complexity Analysis**:
+   - Preprocessing: O(nd log k) (unchanged)
+   - Per-query traversal: O(b log k · d)
+   - Exact computation for selected leaf clusters: O(b · n/k · d)
+   - When k = n/log n and b = O(log n):
+     - Per-query: O(log n · log(n/log n) · d + log n · log n · d) = O(log²n · d)
+     - For all n queries: O(n log²n · d)
+
+This approach achieves near-O(n log n) complexity while maintaining accuracy by adaptively focusing computation on the most relevant parts of the hierarchical tree. With careful tuning of the beam width and pruning strategies, the complexity can be further reduced to O(n log n · d).
+
+The hierarchical structure enables logarithmic-time decision making at each step of the traversal, resulting in significant computational savings compared to flat clustering approaches.
+
+Additionally, the preprocessing step (O(nd log k)) only needs to be performed once for a set of key-value pairs, making this approach particularly efficient for scenarios with many queries against the same key-value set.
+
+The von Mises-Fisher distribution provides a probabilistic framework for clustering directional data on the unit hypersphere, which is ideal for key vectors in attention mechanisms.
+
+### Cumulant Generating Functions and Log Expected Query Mass
+
+The log expected attention mass for a query q over a cluster of keys k drawn from a distribution P(k) is directly related to the cumulant generating function (CGF):
+
+```
+Log expected mass = log(E[exp(q·k)]) = K(q)
+```
+
+Where K(q) is the CGF of the key distribution evaluated at point q. This relationship enables efficient approximation of attention scores using statistical properties of clustered keys:
+
+#### Von Mises-Fisher Distribution
+For keys distributed according to vMF with mean direction μ and concentration κ:
+- The CGF can be expressed using modified Bessel functions
+- For dimension d, K(q) = log(I_{d/2}(||κμ+q||)/I_{d/2}(κ))
+- For high dimensions and large κ, saddle-point approximation gives:
+  - K(q) ≈ (d/2-1)log(κ/||κμ+q||) + (||κμ+q||-κ) + (1/2)log(κ/||κμ+q||)
+- In the simple first-order approximation: K(q) ≈ R·(q·μ) where R = ||μ||
+
+#### Approximating Clusters with Spherical Shells
+When a cluster is better approximated as a spherical shell (keys distributed on a sphere of radius R centered at μ):
+- For sphere centered at origin: K(q) = log(I_{d/2-1}(R·||q||)) - (d/2-1)log(R·||q||) + constant
+- For sphere centered at μ, the CGF becomes a function of the offset: K(q) = log(E[exp(q·(μ+Rz))]) where z is uniform on unit sphere
+- To first order: K(q) ≈ q·μ
+- The covariance structure is Σ = (I-μμᵀ/||μ||²)·R²/d, reflecting isotropic variance perpendicular to μ
+- To second order: K(q) ≈ q·μ + (1/2)·qᵀΣq = q·μ + (R²/2d)·[||q||² - (q·μ)²/||μ||²]
+- This captures both the mean direction effect and the anisotropic variance in different directions
+- In high dimensions, the variance term becomes negligible compared to the mean term
+
+#### Approximating Clusters with Balls
+When a cluster is better approximated as a ball (keys uniformly distributed in a ball of radius R centered at μ):
+- For ball centered at origin: K(q) = log(d·I_{d/2}(R·||q||)·(2/(R·||q||))^{d/2}) where I_v is the modified Bessel function
+- For ball centered at μ: K(q) = log(E[exp(q·(μ+Rz))]) where z is uniform in unit ball
+- To first order: K(q) ≈ q·μ
+- To second order: K(q) ≈ q·μ + R²||q||²/2(d+2)
+- The variance term R²/2(d+2) is smaller than for spherical shells due to lower average distance from center
+- As d increases, both approximations converge to K(q) ≈ q·μ, with the variance terms becoming negligible
+
+These approximations provide theoretical justification for the attention mass estimation functions in the library. The relationship between cluster geometry (R, μ) and the resulting cumulant function explains why the simple first-order approximation (q·μ·R) is often effective, especially in high-dimensional spaces where concentration effects dominate.
+
 ## Library Overview
 
 The `lib.py` file implements core functionality for efficient attention approximation:
