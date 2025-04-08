@@ -107,6 +107,85 @@ When a cluster is better approximated as a ball (keys uniformly distributed in a
 
 These approximations provide theoretical justification for the attention mass estimation functions in the library. The relationship between cluster geometry (R, μ) and the resulting cumulant function explains why the simple first-order approximation (q·μ·R) is often effective, especially in high-dimensional spaces where concentration effects dominate.
 
+### Joint Distribution of Keys and Values: Error Analysis
+
+The accuracy of attention approximation depends not only on modeling the key distribution but also on the joint distribution of keys (k) and values (v). The expected error when approximating the output contribution of a cluster can be analyzed through the joint cumulant generating function (CGF):
+
+```
+K(q,t) = log E[exp(q·k + t·v)]
+```
+
+Where q is the query vector and t is an auxiliary variable for analyzing value contributions. The true attention output for a query is related to the partial derivative of this joint CGF:
+
+```
+E[v·exp(q·k)]/E[exp(q·k)] = ∇_t K(q,0)|_{t=0}
+```
+
+#### Approximation Error Analysis
+
+When approximating a cluster's contribution using only its average value μ_v:
+
+1. **First-Order Approximation (Using μ_v)**
+   - For jointly Gaussian distributions, the error is exactly: Σ_vk·q
+   - Where Σ_vk is the cross-covariance matrix between keys and values
+   - Error magnitude: ||Σ_vk·q||
+   - Perfect only when keys and values are independent (Σ_vk = 0)
+
+2. **Second-Order Approximation (Using μ_v + Σ_vk·q)**
+   - Captures linear correlation between keys and values
+   - Exact for jointly Gaussian distributions
+   - Equivalently: using conditional expectation E[v|q·k]
+
+3. **Higher-Order Errors**
+   - Arise from non-Gaussian aspects of joint distribution
+   - Involve third and higher mixed cumulants between keys and values
+   - Represent nonlinear dependencies not captured by covariance structure
+
+The practical implication is that clustering strategies should consider not just key similarity but also the correlation structure between keys and values within clusters. Even with perfect estimation of attention weights, output errors can be significant if the key-value correlation structure is not properly accounted for.
+
+### Outer Product Clustering: A Unified Approach
+
+An alternative approach that directly addresses the joint key-value distribution challenge is to cluster the outer products kv^T rather than clustering keys and values separately:
+
+#### Theoretical Framework
+
+1. **Direct Optimization of Attention Contribution**
+   - For any query q, its contribution from a key-value pair is (q·k)v
+   - This can be rewritten as q^T·(kv^T)·e, where e is a standard basis vector
+   - The outer product kv^T (d×d matrix) fully captures the attention contribution pattern
+
+2. **Clustering in Outer Product Space**
+   - Represent each token by its kv^T outer product
+   - Define distance metric: ||k₁v₁^T - k₂v₂^T||_F (Frobenius norm)
+   - Cluster these outer products directly
+   - Use cluster centroids as representative kv^T matrices
+
+3. **Error Analysis**
+   - First-order approximation using cluster centroids becomes exact if outer products are identical within clusters
+   - No separate modeling of key-value correlations needed
+   - Error depends solely on the variance of outer products within clusters
+
+#### Complexity Considerations
+
+This approach introduces significant computational trade-offs:
+
+1. **Storage Requirements**
+   - Standard approach: O(nd) for storing n keys and values of dimension d
+   - Outer product approach: O(nd²) for storing n outer products (d×d matrices)
+   - Can be mitigated using low-rank approximations: O(ndr) where r << d
+
+2. **Computational Complexity**
+   - Distance calculations: O(d²) instead of O(d)
+   - Preprocessing: O(nd² log k) instead of O(nd log k)
+   - Query processing: potentially more efficient as it directly optimizes for what matters
+
+3. **Practical Optimizations**
+   - Use structured low-rank approximations of outer products
+   - Hierarchical clustering with SVD-based dimensionality reduction
+   - Progressive refinement focusing on high-error regions
+
+This unified approach elegantly addresses the joint distribution modeling challenge by directly optimizing the structures that contribute to the final attention output. While computationally more intensive in preprocessing, it could potentially achieve higher accuracy with fewer clusters by focusing on the exact patterns that determine attention output quality.
+
 ## Library Overview
 
 The `lib.py` file implements core functionality for efficient attention approximation:
